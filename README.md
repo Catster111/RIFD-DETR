@@ -7,10 +7,10 @@ This guide explains how to train and run inference for face detection with 5 fac
 
 ## 1) Installation & Environment
 - Recommended: Python 3.10+ and PyTorch 2.0+
-- Install dependencies (run inside `RT-DETR/rtdetrv2_pytorch`):
+- Install dependencies (run inside `RIFD-DETR/rtdetrv2_pytorch`):
 
 ```bash
-cd RT-DETR/rtdetrv2_pytorch
+cd RIFD-DETR/rtdetrv2_pytorch
 pip install -r requirements.txt
 ```
 
@@ -107,4 +107,5 @@ Latest visualization combines the 5 keypoint heatmaps into a single overlayed su
 - Dataset loader used in training: `src/data/widerface_keypoints_working.py`
 
 If you need additional helper scripts or examples (e.g., batch inference on a folder), feel free to ask.
+
 
