@@ -1,0 +1,88 @@
+__include__: [
+  '../dataset/widerface_keypoints.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  '../rtdetrv2/include/rtdetrv2_r50vd.yml',
+]
+
+output_dir: ./output/rtdetr_r50vd_widerface_keypoints_v2_padding_aware
+
+# Override for single class (faces)
+num_classes: 1
+
+# PADDING-AWARE TRAINING: Mixed preprocessing to teach model both conditions
+# - 70% traditional distorted preprocessing (current training method)
+# - 30% aspect ratio preserved preprocessing (deployment method)
+
+epoches: 30  # Shorter training since we start from existing model
+eval_freq: 5
+checkpoint_freq: 2
+
+# Face detection + keypoint localization settings
+RTDETRTransformerv2:
+  num_queries: 100
+  use_keypoints: true
+  num_keypoints: 5
+  keypoint_heatmap_size: 64
+
+# MIXED AUGMENTATION PIPELINE
+train_dataloader: 
+  dataset: 
+    type: WiderFaceKeypointDatasetSimplified
+    ann_file: ./dataset/annotations/widerface_keypoints_coco.json
+    img_prefix: ./dataset/images/
+    transforms:
+      type: PaddingAwareMixedAugmentation
+      padding_ratio: 0.3  # 30% padding, 70% distortion
+      target_size: [640, 640]
+      bbox_format: 'coco'
+      keypoint_format: 'xy'
+      color_prob: 0.8
+      geometric_prob: 0.7
+      flip_prob: 0.5
+  shuffle: true
+  total_batch_size: 8
+  num_workers: 4
+  drop_last: true
+  collate_fn:
+    scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+
+# Transfer learning from current best model
+resume: 'output/rtdetr_r50vd_widerface_keypoints_v2_corrected_augmentation/checkpoint0047.pth'
+
+# Enable keypoint processing
+RTDETRPostProcessor:
+  use_keypoints: true
+  remap_widerface_category: true
+  num_top_queries: 100
+
+# Keypoint losses
+RTDETRCriterionv2:
+  use_keypoints: true
+  weight_dict: 
+    loss_vfl: 1
+    loss_bbox: 5 
+    loss_giou: 2
+    loss_keypoint: 2.0
+    loss_keypoint_heatmap: 0.5
+    loss_keypoint_offset: 2.0
+
+# Optimizer for fine-tuning
+optimizer:
+  type: AdamW
+  params:
+    - 
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+    -
+      params: '^(?=.*keypoint).*$'
+      lr: 5.e-4  # Lower LR for fine-tuning
+      weight_decay: 1.e-4
+  lr: 1.e-5  # Very low LR for fine-tuning
+  weight_decay: 1.e-4
+
+# Training notes:
+# This config implements transfer learning from the existing model
+# Model will gradually learn to handle both distorted and padded images
+# Expected outcome: Better scale accuracy with aspect ratio preservation

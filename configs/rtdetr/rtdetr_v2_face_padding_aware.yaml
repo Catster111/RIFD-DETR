@@ -1,0 +1,208 @@
+__include__: [
+  '../dataset/widerface_keypoints.yml',
+  '../runtime.yml',
+  '../rtdetrv2/include/rtdetrv2_r50vd.yml'
+]
+
+yaml_cfg:
+
+  task: detection
+
+# Model definition
+model: RTDETR
+criterion: RTDETRCriterionv2
+postprocessor: RTDETRPostProcessor
+
+# Override face-specific settings
+num_classes: 1
+use_focal_loss: true
+eval_spatial_size: [640, 640]
+
+# Override backbone to ResNet-18 for face detection
+PResNet:
+  depth: 18
+  variant: d
+  freeze_at: 0
+  return_idx: [1, 2, 3]
+  num_stages: 4
+  freeze_norm: True
+  pretrained: True
+
+# Update encoder for ResNet-18 feature dimensions  
+HybridEncoder:
+  in_channels: [128, 256, 512]  # ResNet-18 feature dimensions
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.
+  enc_act: 'gelu'
+  expansion: 1.0
+  depth_mult: 1
+  act: 'silu'
+
+# Model architecture with keypoints
+RTDETRTransformerv2:
+  num_classes: ${num_classes}
+  use_keypoints: true
+  num_keypoints: 5
+  keypoint_heatmap_size: 64
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 6
+  num_queries: 100
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  eval_idx: -1
+  num_points: [4, 4, 4]
+  cross_attn_method: default
+  query_select_method: default
+
+RTDETRPostProcessor:
+  num_classes: ${num_classes}
+  use_keypoints: true
+  remap_widerface_category: true
+
+RTDETRCriterionv2:
+  num_classes: ${num_classes}
+  use_keypoints: true
+  weight_dict: 
+    loss_vfl: 1
+    loss_bbox: 5
+    loss_giou: 2
+    loss_keypoint: 1.0
+    loss_keypoint_heatmap: 1.0
+    loss_keypoint_offset: 0.1
+
+# Padding-aware mixed training configuration
+train_dataloader: 
+  dataset: 
+    type: WiderFaceKeypointDatasetSimplified
+    ann_file: ./dataset/annotations/widerface_keypoints_coco.json
+    img_prefix: ./dataset/images/
+    transforms:
+      type: PaddingAwareMixedAugmentation
+      padding_ratio: 0.2  # Start with 20% padding, will increase during training
+      target_size: [640, 640]
+      bbox_format: 'coco'
+      keypoint_format: 'xy'
+      color_prob: 0.8
+      geometric_prob: 0.7
+      flip_prob: 0.5
+  shuffle: true
+  batch_size: 8
+  num_workers: 4
+  drop_last: true
+  collate_fn:
+    type: default_collate_fn
+
+val_dataloader:
+  dataset:
+    type: WiderFaceKeypointDatasetSimplified
+    ann_file: ./dataset/annotations/widerface_keypoints_coco.json
+    img_prefix: ./dataset/images/
+    transforms:
+      type: Compose
+      ops:
+        # Validation uses aspect ratio preservation to match deployment
+        - type: Resize
+          size: [640, 640]
+          keep_ratio: true
+          fill_value: 0
+        - type: ConvertPILImage
+          dtype: 'float32'
+          scale: true
+        - type: ConvertBoxes
+          fmt: 'cxcywh'
+          normalize: true
+  shuffle: false
+  batch_size: 8
+  num_workers: 4
+  drop_last: false
+
+# Training configuration
+optimizer:
+  type: AdamW
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [30, 40]
+  gamma: 0.1
+
+# Transfer learning from current model
+train_cfg:
+  resume: 'output/rtdetr_r50vd_widerface_keypoints_v2_corrected_augmentation/checkpoint0047.pth'
+  find_unused_parameters: false
+  use_amp: true
+  sync_norm: true
+  ema:
+    decay: 0.9999
+    warmups: 2000
+
+# Curriculum learning schedule
+curriculum_config:
+  # Week 1: Gentle introduction (20% padding)
+  phase_1:
+    epochs: [0, 10]
+    padding_ratio: 0.2
+    description: "Gentle introduction to padding"
+  
+  # Week 2: Moderate increase (40% padding)  
+  phase_2:
+    epochs: [10, 20]
+    padding_ratio: 0.4
+    description: "Moderate padding introduction"
+  
+  # Week 3: Balanced training (60% padding)
+  phase_3:
+    epochs: [20, 30]
+    padding_ratio: 0.6
+    description: "Balanced distorted/padded training"
+  
+  # Week 4: Heavy padding (80% padding)
+  phase_4:
+    epochs: [30, 40]
+    padding_ratio: 0.8
+    description: "Deployment-like conditions"
+
+num_epochs: 40
+eval_freq: 5
+print_freq: 50
+
+# Output configuration
+output_dir: './output/rtdetr_r50vd_widerface_keypoints_v2_padding_aware'
+
+# Validation strategy
+validation_metrics:
+  # Test on both distorted and padded images
+  distorted_test:
+    preprocessing: 'distorted'
+    target_mAP: 0.85  # Should maintain current performance
+  
+  padded_test:
+    preprocessing: 'padded'
+    target_improvement: 0.2  # 20% better scale accuracy vs quick fix
+  
+  scale_accuracy:
+    measure_calibration_need: true
+    target_low_calibration: 0.9  # 90% of images need < 1.2x calibration
+
+# Logging and monitoring
+wandb:
+  project: "rt-detr-padding-aware"
+  name: "mixed-augmentation-training"
+  tags: ["padding-aware", "mixed-preprocessing", "curriculum-learning"]
+
+# Model export settings
+export:
+  onnx: true
+  trt: false  # Enable after training completion
+  optimize_for_deployment: true

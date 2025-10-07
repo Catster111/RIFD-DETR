@@ -1,0 +1,41 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox']
+
+num_classes: 1  # Only face class
+remap_mscoco_category: False
+
+train_dataloader: 
+  type: DataLoader
+  dataset: 
+    type: WiderFaceKeypointDatasetWorking  # Use working dataset
+    ann_file: ./dataset/annotations/widerface_keypoints_coco.json
+    img_prefix: ./dataset/images/
+    transforms:
+      type: Compose
+      ops: ~  # Will be overridden by main config
+  shuffle: True
+  num_workers: 4
+  drop_last: True 
+  collate_fn:
+    type: BatchImageCollateFuncion
+
+val_dataloader:
+  type: DataLoader
+  dataset: 
+    type: WiderFaceKeypointDatasetWorking  # Use working dataset
+    ann_file: ./dataset/annotations/widerface_keypoints_coco.json
+    img_prefix: ./dataset/images/
+    transforms:
+      type: Compose
+      ops: 
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+  shuffle: False
+  num_workers: 0
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFuncion

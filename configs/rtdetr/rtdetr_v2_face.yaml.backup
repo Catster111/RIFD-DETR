@@ -1,0 +1,76 @@
+__include__: [
+  '../dataset/widerface_keypoints.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  '../rtdetrv2/include/rtdetrv2_r50vd.yml',
+]
+
+output_dir: ./output/rtdetr_r50vd_widerface_keypoints_v2_simplified
+
+# Override for single class (faces)
+num_classes: 1
+
+# SIMPLIFIED PIPELINE: Uses WiderFaceKeypointDatasetSimplified
+# - Direct CXCYWH normalized format from dataset
+# - No complex format conversions needed
+# - Unified coordinate system throughout pipeline
+
+epoches: 50
+eval_freq: 50  # Evaluate only at the end 
+checkpoint_freq: 2  # Save checkpoint every 2 epochs
+
+# Face detection + keypoint localization settings
+RTDETRTransformerv2:
+  num_queries: 100  # Fewer queries for face detection
+  use_keypoints: true  # Enable keypoint prediction
+  num_keypoints: 5     # 5 facial keypoints
+  keypoint_heatmap_size: 64  # Heatmap resolution
+
+# Simplified augmentation pipeline with direct RT-DETR format
+train_dataloader: 
+  dataset: 
+    transforms:
+      type: Compose
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}  # Color augmentation
+        - {type: RandomHorizontalFlip, p: 0.5}      # Mirror augmentation
+        - {type: Resize, size: [640, 640]}          # Resize to target resolution
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+      policy:
+        name: default
+  collate_fn:
+    scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]  # Multi-scale training
+
+batch_size: 4
+
+# Enable keypoint processing in PostProcessor
+RTDETRPostProcessor:
+  use_keypoints: true
+  remap_widerface_category: true  # Fix: label 0 → category_id 1
+  num_top_queries: 100
+
+# Add keypoint losses to criterion
+RTDETRCriterionv2:
+  use_keypoints: true
+  keypoint_loss_weight: 2.0  # Increased significantly 
+  weight_dict: 
+    loss_vfl: 1
+    loss_bbox: 5 
+    loss_giou: 2
+    loss_keypoint: 8.0  # Moderate total keypoint loss
+    loss_keypoint_heatmap: 3.0  # Balanced heatmap learning
+    loss_keypoint_offset: 20.0  # Offset learning (0.1 × 20.0 = 2.0)
+
+optimizer:
+  type: AdamW
+  params:
+    - 
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+    -
+      params: '^(?=.*keypoint).*$'  # Higher LR for keypoint head
+      lr: 1.e-3
+      weight_decay: 1.e-4
+  lr: 2.e-5  # Base learning rate for other components
+  weight_decay: 1.e-4

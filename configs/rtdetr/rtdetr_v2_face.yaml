@@ -1,0 +1,113 @@
+__include__: [
+  '../dataset/widerface_keypoints_working.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  '../rtdetrv2/include/rtdetrv2_r50vd.yml',
+]
+
+output_dir: ./output/bestModel
+
+# Override for single class (faces)
+num_classes: 1
+
+# CORRECTED PIPELINE: Uses WiderFaceKeypointDatasetSimplified with proper augmentation
+# - Direct CXCYWH normalized format from dataset
+# - Proper affine rotation transformation
+# - Correct keypoint handling for all transforms
+
+epoches: 110
+eval_freq: 100  # More frequent evaluation to monitor progress
+checkpoint_freq: 5  # Save checkpoint every 5 epochs
+
+# Face detection + keypoint localization settings
+RTDETRTransformerv2:
+  num_queries: 75  # Fewer queries for face detection
+  use_keypoints: true  # Enable keypoint prediction
+  num_keypoints: 5     # 5 facial keypoints
+  keypoint_heatmap_size: 64  # Heatmap resolution
+  keypoint_heatmap_domain: polar
+ 
+
+# WORKING AUGMENTATION: Proven TorchVision TV tensor pipeline
+train_dataloader: 
+  dataset: 
+    type: WiderFaceKeypointDatasetWorking  # Working dataset with TV tensors
+    transforms:
+      type: Compose
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}  # Color robustness ✅
+        - {type: RandomHorizontalFlipWithKeypoints, p: 0.5}     # Mirror + keypoint swap ✅  
+        - {type: RandomZoomOutWithKeypoints, fill: 0}            # Scale variation ✅
+        - {type: RandomIoUCropWithKeypoints, p: 0.8}            # Spatial crops ✅
+        - {type: RandomRotationWithKeypoints, degrees: 180, fill: 0, p: 0.8}  # Rotation ✅
+        - {type: FilterDegenerateBoxesWithKeypoints, min_size: 1.0}  # Drop invalid boxes + kpts
+        - {type: Resize, size: [640, 640]}         # Final resize ✅
+        - {type: NormalizeKeypoints}               # Normalize bbox/keypoints ✅
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        name: stop_epoch
+        epoch: 105  # Stop aggressive augmentation after epoch 47
+        ops: ['RandomPhotometricDistort', 'RandomZoomOutWithKeypoints', 'RandomIoUCropWithKeypoints', 'RandomRotationWithKeypoints']
+  collate_fn:
+    type: BatchImageCollateFuncion
+    scales: [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]  # Multi-scale training
+    stop_epoch: 80  # Stop multi-scale after epoch 47
+
+batch_size: 4
+
+# Enable keypoint processing in PostProcessor
+RTDETRPostProcessor:
+  use_keypoints: true
+  remap_widerface_category: true  # Fix: label 0 → category_id 1
+  num_top_queries: 100
+  keypoint_heatmap_domain: polar
+  enable_nms: true
+
+# Add keypoint losses to criterion
+RTDETRCriterionv2:
+  use_keypoints: true
+  keypoint_loss_weight: 1.0  # Normal weight for learning
+  keypoint_heatmap_domain: polar
+  weight_dict: 
+    loss_vfl: 1
+    loss_bbox: 5 
+    loss_giou: 2
+    loss_keypoint: 6.0     # Stronger keypoint regression
+    loss_keypoint_heatmap: 5.0   # Sharper heatmap supervision
+    loss_keypoint_offset: 0.2    # Encourage offset refinement
+
+RotationalConsistency:
+  enable: true
+  angles: [30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330]
+  prob: 0.1
+  loss_weight_bbox: 0.2
+  loss_weight_cls: 0.1
+  loss_weight_kpt: 2
+  keypoint_domain: polar
+
+AngleBalancedReweight:
+  enable: True
+  alpha: 1.0
+  max_angle: 180.0
+  min_weight: 1.0
+  max_weight: 3.0
+
+optimizer:
+  type: AdamW
+  params:
+    - 
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+    -
+      params: '^(?=.*keypoint).*$'  # Reduced LR for keypoint head
+      lr: 5.e-5  # Much lower keypoint LR to prevent collapse
+      weight_decay: 1.e-4
+  lr: 2.e-5  # Base learning rate for other components
+  weight_decay: 1.e-4
+
+# TRAINING NOTE:
+# To use the corrected augmentation, you need to either:
+# 1. Modify the dataset class to use CorrectedAugmentation, or
+# 2. Create a custom training script that applies CorrectedAugmentation

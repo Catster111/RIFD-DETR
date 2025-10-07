@@ -1,0 +1,349 @@
+"""
+Simplified WiderFace dataset with direct RT-DETR format support and CorrectedAugmentation
+WiderFace dataset ที่ปรับให้ใช้ RT-DETR format ตั้งแต่แรก พร้อม augmentation ที่ถูกต้อง
+"""
+
+import os
+import json
+from torch.utils.data import Dataset
+from PIL import Image
+import torch
+import torchvision.transforms as T
+from collections import defaultdict
+import random
+import math
+
+from ..core import register
+from ._misc import convert_to_tv_tensor
+
+class CorrectedAugmentation:
+    """Augmentation ที่ใช้ affine transformation สำหรับ rotation ที่ถูกต้อง"""
+    
+    def __init__(self, flip_prob=0.5, color_prob=0.8, rotation_prob=0.7, max_rotation=15):
+        self.flip_prob = flip_prob
+        self.color_prob = color_prob
+        self.rotation_prob = rotation_prob
+        self.max_rotation = max_rotation
+        
+        # Enhanced color augmentation
+        self.color_transforms = [
+            T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
+            T.ColorJitter(brightness=0.6, contrast=0.3, saturation=0.5, hue=0.1),
+            T.ColorJitter(brightness=0.3, contrast=0.6, saturation=0.3, hue=0.15),
+        ]
+    
+    def __call__(self, image, target):
+        """Apply augmentation with correct affine transformation"""
+        
+        # Convert to PIL if tensor
+        if isinstance(image, torch.Tensor):
+            if image.shape[0] == 3:  # CHW format
+                image_np = image.permute(1, 2, 0).numpy()
+            else:
+                image_np = image.numpy()
+            
+            if image_np.max() <= 1.0:
+                image_np = (image_np * 255).astype(np.uint8)
+            
+            image_pil = Image.fromarray(image_np)
+        else:
+            image_pil = image
+        
+        # Get image dimensions
+        img_width, img_height = image_pil.size
+        
+        # Track transformations
+        applied_transforms = {
+            'rotation_angle': 0,
+            'flipped': False,
+            'color_changed': False,
+            'affine_matrix': None
+        }
+        
+        # Apply rotation with affine transformation
+        rotation_angle = 0
+        if random.random() < self.rotation_prob:
+            rotation_angle = random.uniform(-self.max_rotation, self.max_rotation)
+            
+            # Apply rotation using affine
+            from torchvision.transforms.functional import affine
+            image_pil = affine(
+                image_pil, 
+                angle=rotation_angle,
+                translate=[0, 0],
+                scale=1.0,
+                shear=0,
+                fill=0
+            )
+            
+            applied_transforms['rotation_angle'] = rotation_angle
+            
+            # Create affine transformation matrix for coordinates
+            angle_rad = math.radians(rotation_angle)
+            cos_a = math.cos(angle_rad)
+            sin_a = math.sin(angle_rad)
+            
+            # Rotation matrix around center of image
+            cx, cy = img_width / 2, img_height / 2
+            
+            applied_transforms['affine_matrix'] = {
+                'angle': rotation_angle,
+                'cos_a': cos_a,
+                'sin_a': sin_a,
+                'center_x': cx / img_width,  # normalized center
+                'center_y': cy / img_height
+            }
+        
+        # Apply color augmentation
+        if random.random() < self.color_prob:
+            color_transform = random.choice(self.color_transforms)
+            image_pil = color_transform(image_pil)
+            applied_transforms['color_changed'] = True
+        
+        # Apply horizontal flip
+        if random.random() < self.flip_prob:
+            image_pil = T.functional.hflip(image_pil)
+            applied_transforms['flipped'] = True
+        
+        # Convert back to tensor
+        image_tensor = T.ToTensor()(image_pil)
+        
+        # Apply transforms to target using proper affine transformation
+        new_target = self._transform_target_affine(target, applied_transforms)
+        
+        return image_tensor, new_target
+    
+    def _transform_target_affine(self, target, transforms):
+        """Transform target using proper affine transformation"""
+        new_target = {}
+        
+        # Copy non-spatial data
+        for key in ['labels', 'area', 'iscrowd', 'image_id', 'orig_size', 'size', 'idx']:
+            if key in target:
+                new_target[key] = target[key].clone() if hasattr(target[key], 'clone') else target[key]
+        
+        boxes = target['boxes'].clone()
+        keypoints = target['keypoints'].clone()
+        
+        # Apply rotation using affine transformation
+        if transforms['affine_matrix'] is not None:
+            affine_info = transforms['affine_matrix']
+            cos_a = affine_info['cos_a']
+            sin_a = affine_info['sin_a']
+            center_x = affine_info['center_x']
+            center_y = affine_info['center_y']
+            
+            # Transform bounding boxes
+            for i, box in enumerate(boxes):
+                cx, cy, w, h = box
+                
+                # Transform center point
+                px = cx - center_x
+                py = cy - center_y
+                
+                new_px = px * cos_a - py * sin_a
+                new_py = px * sin_a + py * cos_a
+                
+                new_cx = new_px + center_x
+                new_cy = new_py + center_y
+                
+                # Clamp to valid range
+                new_cx = max(w/2, min(1-w/2, new_cx))
+                new_cy = max(h/2, min(1-h/2, new_cy))
+                
+                boxes[i] = torch.tensor([new_cx, new_cy, w, h])
+            
+            # Transform keypoints
+            for face_idx, face_kps in enumerate(keypoints):
+                new_face_kps = torch.zeros_like(face_kps)
+                
+                for kp_idx, keypoint in enumerate(face_kps):
+                    if len(keypoint) >= 3:
+                        x, y, vis = keypoint
+                        
+                        px = x - center_x
+                        py = y - center_y
+                        
+                        new_px = px * cos_a - py * sin_a
+                        new_py = px * sin_a + py * cos_a
+                        
+                        new_x = new_px + center_x
+                        new_y = new_py + center_y
+                        
+                        new_x = max(0, min(1, new_x))
+                        new_y = max(0, min(1, new_y))
+                        
+                        new_face_kps[kp_idx] = torch.tensor([new_x, new_y, vis])
+                
+                keypoints[face_idx] = new_face_kps
+        
+        # Apply horizontal flip
+        if transforms['flipped']:
+            # Flip bounding boxes
+            for i, box in enumerate(boxes):
+                cx, cy, w, h = box
+                new_cx = 1.0 - cx
+                boxes[i] = torch.tensor([new_cx, cy, w, h])
+            
+            # Flip keypoints with proper left/right swapping
+            for face_idx, face_kps in enumerate(keypoints):
+                new_face_kps = torch.zeros_like(face_kps)
+                
+                for kp_idx, keypoint in enumerate(face_kps):
+                    if len(keypoint) >= 3:
+                        x, y, vis = keypoint
+                        new_x = 1.0 - x
+                        
+                        # Map keypoints with proper left/right swapping
+                        if kp_idx == 0:  # left_eye -> right_eye position
+                            new_face_kps[1] = torch.tensor([new_x, y, vis])
+                        elif kp_idx == 1:  # right_eye -> left_eye position  
+                            new_face_kps[0] = torch.tensor([new_x, y, vis])
+                        elif kp_idx == 2:  # nose stays at nose
+                            new_face_kps[2] = torch.tensor([new_x, y, vis])
+                        elif kp_idx == 3:  # left_mouth -> right_mouth position
+                            new_face_kps[4] = torch.tensor([new_x, y, vis])
+                        elif kp_idx == 4:  # right_mouth -> left_mouth position
+                            new_face_kps[3] = torch.tensor([new_x, y, vis])
+                        else:
+                            new_face_kps[kp_idx] = torch.tensor([new_x, y, vis])
+                
+                keypoints[face_idx] = new_face_kps
+        
+        new_target['boxes'] = boxes
+        new_target['keypoints'] = keypoints
+        
+        return new_target
+
+@register()
+class WiderFaceKeypointDatasetSimplified(Dataset):
+    __inject__ = ['transforms', ]
+    
+    def __init__(self, ann_file, img_prefix, transforms=None, return_masks=False, **kwargs):
+        with open(ann_file, 'r') as f:
+            self.coco = json.load(f)
+
+        self.img_prefix = img_prefix
+        self._transforms = transforms
+        self.epoch = 0  # Initialize epoch for transform policies
+        self.image_dict = {img['id']: img for img in self.coco['images']}
+        
+        # Group annotations by image_id for multi-instance images
+        self.img_ann_dict = defaultdict(list)
+        for ann in self.coco['annotations']:
+            self.img_ann_dict[ann['image_id']].append(ann)
+        
+        self.image_ids = list(self.img_ann_dict.keys())
+        
+        # Create corrected augmentation if no transforms provided
+        if self._transforms is None:
+            self._corrected_augmentation = CorrectedAugmentation(
+                flip_prob=0.5,      # 50% horizontal flip
+                color_prob=0.8,     # 80% color augmentation  
+                rotation_prob=0.7,  # 70% rotation
+                max_rotation=15     # ±15° rotation
+            )
+        else:
+            self._corrected_augmentation = None
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        img_meta = self.image_dict[image_id]
+        annotations = self.img_ann_dict[image_id]
+        
+        # Handle WiderFace path format: remove "WIDER_train/images/" prefix
+        file_name = img_meta['file_name']
+        if file_name.startswith('WIDER_train/images/'):
+            file_name = file_name.replace('WIDER_train/images/', '')
+        img_path = os.path.join(self.img_prefix, file_name)
+        
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            # Return empty data if image can't be loaded
+            return torch.zeros(3, 640, 640), {
+                'boxes': torch.empty((0, 4)),
+                'labels': torch.empty((0,), dtype=torch.int64),
+                'keypoints': torch.empty((0, 5, 3)),
+                'image_id': torch.tensor([image_id]),
+                'idx': torch.tensor([idx])
+            }
+        
+        orig_w, orig_h = image.size
+        
+        boxes = []
+        labels = []
+        keypoints_list = []
+        areas = []
+        
+        for ann in annotations:
+            # Convert bbox directly from COCO [x, y, w, h] to RT-DETR [cx, cy, w, h] normalized
+            bbox = ann['bbox']
+            x, y, w, h = bbox
+            
+            # Convert to center coordinates and normalize by image size
+            cx = (x + w/2) / orig_w
+            cy = (y + h/2) / orig_h 
+            w_norm = w / orig_w
+            h_norm = h / orig_h
+            
+            boxes.append([cx, cy, w_norm, h_norm])
+            
+            # Process keypoints if available
+            if 'keypoints' in ann and ann['keypoints']:
+                kpts = ann['keypoints']
+                kpts_normalized = []
+                
+                # Process each keypoint (5 keypoints expected)
+                for i in range(0, min(len(kpts), 15), 3):  # x, y, visibility for each keypoint
+                    kp_x = kpts[i] / orig_w      # Normalize x
+                    kp_y = kpts[i + 1] / orig_h  # Normalize y
+                    kp_vis = kpts[i + 2] if i + 2 < len(kpts) else 2  # Visibility
+                    kpts_normalized.append([kp_x, kp_y, kp_vis])
+                
+                # Ensure we have exactly 5 keypoints (pad with zeros if needed)
+                while len(kpts_normalized) < 5:
+                    kpts_normalized.append([0.0, 0.0, 0])  # Invisible keypoint
+                
+                keypoints_list.append(torch.tensor(kpts_normalized[:5], dtype=torch.float32))
+            else:
+                # No keypoints provided, create default invisible keypoints
+                keypoints_list.append(torch.zeros(5, 3, dtype=torch.float32))
+            
+            labels.append(0)  # Face class = 0 (for training consistency)
+            areas.append(ann['area'] / (orig_w * orig_h))  # Normalize area too
+        
+        # Create tensors in RT-DETR format
+        boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+        
+        target = {
+            'boxes': boxes_tensor,  # Already in CXCYWH normalized format
+            'labels': torch.tensor(labels, dtype=torch.int64),
+            'keypoints': torch.stack(keypoints_list) if keypoints_list else torch.empty((0, 5, 3)),
+            'area': torch.tensor(areas, dtype=torch.float32),
+            'iscrowd': torch.zeros(len(boxes), dtype=torch.int64),
+            'image_id': torch.tensor([image_id]),
+            'orig_size': torch.tensor([orig_h, orig_w]),
+            'size': torch.tensor([orig_w, orig_h]),  # W, H format for consistency
+            'idx': torch.tensor([idx])
+        }
+
+        # Apply transforms
+        if self._transforms is not None:
+            image, target, _ = self._transforms(image, target, self)
+        elif self._corrected_augmentation is not None:
+            # Use corrected augmentation
+            image, target = self._corrected_augmentation(image, target)
+        else:
+            # Apply basic resize to 640x640 if no transforms
+            basic_transform = T.Compose([
+                T.Resize((640, 640)),
+                T.ToTensor()
+            ])
+            image = basic_transform(image)
+
+        return image, target

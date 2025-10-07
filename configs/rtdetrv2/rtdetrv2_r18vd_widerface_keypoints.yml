@@ -1,0 +1,65 @@
+__include__: [
+  '../dataset/widerface_keypoints.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+output_dir: ./output/rtdetrv2_r18vd_widerface_keypoints
+
+# Override for single class (faces)
+num_classes: 1
+
+# CRITICAL FIX: Add explicit evaluator config
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox']
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+
+HybridEncoder:
+  in_channels: [128, 256, 512]  # ResNet18 feature channels
+  hidden_dim: 256
+  expansion: 0.5
+
+RTDETRTransformerv2:
+  num_layers: 3
+  num_queries: 100  # Fewer queries for face detection
+
+RTDETRPostProcessor:
+  num_top_queries: 100  # Match with num_queries
+  use_focal_loss: True  # Explicit focal loss
+  remap_mscoco_category: False  # Explicit MS COCO disable
+  remap_widerface_category: True  # Convert label 0 -> category_id 1
+
+epoches: 50
+
+# Reduced batch size for keypoint task
+train_dataloader: 
+  dataset: 
+    transforms:
+      policy:
+        epoch: 47
+  collate_fn:
+    scales: ~
+    
+# Override batch size
+batch_size: 8
+
+optimizer:
+  type: AdamW
+  params:
+    - 
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 1.e-4
+  weight_decay: 1.e-4
+# Fix evaluation hang
+val_dataloader:
+  num_workers: 0  # Single threaded to avoid hang
+  total_batch_size: 1   # Small batch for stability
